@@ -22,6 +22,7 @@ const config = {
   appId: process.env.APP_ID || "",
   appSecret: process.env.APP_SECRET || "",
   redirectUri: process.env.REDIRECT_URI || "http://localhost:3000/auth/callback",
+  webhookVerifyToken: normalizeAccessToken(process.env.WEBHOOK_VERIFY_TOKEN || "my_verify_token"),
   port: Number(process.env.PORT || 3000),
 };
 
@@ -53,12 +54,16 @@ function maskToken(token) {
   return `${token.slice(0, 6)}...${token.slice(-6)}`;
 }
 
+function getTimestamp() {
+  return new Date().toISOString();
+}
+
 function logDebug(reqId, message, meta) {
   if (meta) {
-    console.log(`[${reqId}] ${message}`, meta);
+    console.log(`[${getTimestamp()}][${reqId}] ${message}`, meta);
     return;
   }
-  console.log(`[${reqId}] ${message}`);
+  console.log(`[${getTimestamp()}][${reqId}] ${message}`);
 }
 
 function getUserToken(req) {
@@ -134,6 +139,27 @@ function buildGraphError(error) {
   return {
     status: error.response?.status || 500,
     details: error.response?.data || { message: error.message || "Unknown error" },
+  };
+}
+
+function parseWebhookVerification(req) {
+  // Meta sends these query params when verifying the webhook endpoint.
+  const mode = typeof req.query["hub.mode"] === "string" ? req.query["hub.mode"] : "";
+  const token = typeof req.query["hub.verify_token"] === "string" ? req.query["hub.verify_token"] : "";
+  const challenge = typeof req.query["hub.challenge"] === "string" ? req.query["hub.challenge"] : "";
+
+  return {
+    mode,
+    token: normalizeAccessToken(token),
+    challenge,
+  };
+}
+
+function getWebhookSignatureHeaders(req) {
+  // Placeholder for future signature verification.
+  return {
+    sha256: typeof req.get("x-hub-signature-256") === "string" ? req.get("x-hub-signature-256") : "",
+    legacy: typeof req.get("x-hub-signature") === "string" ? req.get("x-hub-signature") : "",
   };
 }
 
@@ -472,6 +498,77 @@ app.get("/debug-token", async (req, res) => {
       error: "Debug failed",
       details: graphErr.details,
     });
+  }
+});
+
+// ===============================
+// WEBHOOK CONFIG
+// ===============================
+// Use a dedicated verify token for Meta webhook setup.
+// Store it in WEBHOOK_VERIFY_TOKEN in production.
+
+// WEBHOOK VERIFICATION
+// Meta calls this route during webhook setup with hub.mode, hub.verify_token, and hub.challenge.
+app.get("/webhook", (req, res) => {
+  const reqId = makeRequestId();
+  const { mode, token, challenge } = parseWebhookVerification(req);
+
+  logDebug(reqId, "Webhook verification request received", {
+    mode: mode || null,
+    token: maskToken(token),
+    challengeReceived: Boolean(challenge),
+  });
+
+  if (mode !== "subscribe") {
+    return res.sendStatus(400);
+  }
+
+  if (!challenge) {
+    return res.sendStatus(400);
+  }
+
+  if (token !== config.webhookVerifyToken) {
+    logDebug(reqId, "Webhook verification failed: invalid verify token");
+    return res.sendStatus(403);
+  }
+
+  logDebug(reqId, "WEBHOOK VERIFIED SUCCESSFULLY");
+  return res.status(200).send(challenge);
+});
+
+// WEBHOOK EVENTS
+// Meta sends Instagram webhook payloads here after verification succeeds.
+// This handler is defensive and never assumes req.body has a specific shape.
+app.post("/webhook", (req, res) => {
+  const reqId = makeRequestId();
+
+  try {
+    const signatures = getWebhookSignatureHeaders(req);
+    if (signatures.sha256 || signatures.legacy) {
+      logDebug(reqId, "Webhook signature headers detected", {
+        hasSha256: Boolean(signatures.sha256),
+        hasLegacy: Boolean(signatures.legacy),
+      });
+    }
+
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+
+    logDebug(reqId, "Instagram webhook event received", {
+      object: body.object || null,
+      entryCount: Array.isArray(body.entry) ? body.entry.length : 0,
+    });
+
+    console.log(`[${getTimestamp()}][${reqId}] WEBHOOK EVENT PAYLOAD`);
+    console.log(JSON.stringify(body, null, 2));
+
+    // ACK quickly so Meta does not retry the delivery.
+    return res.sendStatus(200);
+  } catch (error) {
+    logDebug(reqId, "Webhook event handler failed", {
+      error: error.message || "Unknown error",
+    });
+
+    return res.sendStatus(500);
   }
 });
 
