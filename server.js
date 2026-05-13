@@ -346,6 +346,17 @@ app.get("/instagram-data", async (req, res) => {
     // This handler is defensive and never assumes req.body has a specific shape.
     app.post("/webhook", (req, res) => {
       const reqId = makeRequestId();
+      // Developer convenience: print raw body to console for quick debugging
+      console.log("======================================");
+      console.log("WEBHOOK POST HIT");
+      console.log(new Date().toISOString());
+      console.log("\nBODY:");
+      try {
+        console.log(JSON.stringify(req.body, null, 2));
+      } catch (e) {
+        console.log(String(req.body));
+      }
+      console.log("======================================");
 
       // Acknowledge immediately to avoid Meta retries. Processing continues async.
       res.status(200).send("EVENT_RECEIVED");
