@@ -341,137 +341,137 @@ app.get("/instagram-data", async (req, res) => {
       });
     }
 
-    logDebug(reqId, "Granular scopes inspected", {
-      granularScopeCount: granularScopes.length,
-      pageCountFromGranularScopes: pageIds.length,
-    });
+    // WEBHOOK EVENTS
+    // Meta sends Instagram webhook payloads here after verification succeeds.
+    // This handler is defensive and never assumes req.body has a specific shape.
+    app.post("/webhook", (req, res) => {
+      const reqId = makeRequestId();
 
-    if (pageIds.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        requestId: reqId,
-        error: "No Page IDs found in granular scopes",
-        reasons: [
-          "Token is valid, but granular_scopes does not include page target_ids",
-          "The app may not have been granted pages_show_list on this exact token",
-          "The user may not have page-level access in the connected Business/Page",
-          "The token may belong to a different app, business, or role context",
-        ],
-        scopes,
-        missingScopes,
-        granularScopes,
-      });
-    }
+      // Acknowledge immediately to avoid Meta retries. Processing continues async.
+      res.status(200).send("EVENT_RECEIVED");
 
-    // STEP 2: Resolve each Page directly by ID from the token's granular scopes.
-    const pageDetails = await Promise.all(
-      pageIds.map(async (pageId) => {
+      (async () => {
         try {
-          const pageInfoResponse = await axios.get(`${GRAPH_BASE}/${pageId}`, {
-            params: {
-              fields: "id,name,instagram_business_account",
-              access_token: accessToken,
-            },
+          const signatures = getWebhookSignatureHeaders(req);
+          if (signatures.sha256 || signatures.legacy) {
+            logDebug(reqId, "Webhook signature headers detected", {
+              hasSha256: Boolean(signatures.sha256),
+              hasLegacy: Boolean(signatures.legacy),
+            });
+          }
+
+          const body = req.body && typeof req.body === "object" ? req.body : {};
+
+          logDebug(reqId, "Instagram webhook event received", {
+            object: body.object || null,
+            entryCount: Array.isArray(body.entry) ? body.entry.length : 0,
           });
 
-          const pageInfo = pageInfoResponse.data || {};
-          return {
-            id: pageId,
-            name: pageInfo.name || null,
-            hasInstagramBusinessAccount: Boolean(pageInfo.instagram_business_account?.id),
-            instagramBusinessAccountId: pageInfo.instagram_business_account?.id || null,
-            status: "ok",
-          };
-        } catch (pageError) {
-          const pageErr = buildGraphError(pageError);
-          logDebug(reqId, `Failed to fetch page ${pageId}`, pageErr.details);
+          // Process each entry -> changes array.
+          const entries = Array.isArray(body.entry) ? body.entry : [];
 
-          return {
-            id: pageId,
-            name: null,
-            hasInstagramBusinessAccount: false,
-            instagramBusinessAccountId: null,
-            status: "error",
-            error: pageErr.details,
-          };
+          for (const entry of entries) {
+            const changes = Array.isArray(entry.changes) ? entry.changes : [];
+
+            for (const change of changes) {
+              const value = change?.value || {};
+
+              // Build a dedupe id for the event. Prefer comment_id if present.
+              const eventId = value.comment_id || value.id || value.message_id || `${entry.id || ""}:${change.field || ""}:${value.created_time || ""}`;
+
+              if (!eventId) {
+                logDebug(reqId, "Skipping event with no identifiable id", { change });
+                continue;
+              }
+
+              if (isDuplicateEvent(eventId)) {
+                logDebug(reqId, "Duplicate event ignored", { eventId });
+                continue;
+              }
+
+              // Detect comment events. Meta uses 'item': 'comment' and 'verb': 'add' for new comments.
+              const isComment = value?.item === "comment" || Boolean(value?.comment_id) || typeof value?.text === "string";
+
+              if (!isComment) {
+                logDebug(reqId, "Non-comment event ignored", { field: change.field || null });
+                continue;
+              }
+
+              // Extract comment metadata safely
+              const commentText = (value.text || value.message || value.comment_text || "").toString();
+              const commentTextLower = commentText.toLowerCase();
+              const commenterId = value.from?.id || value.commenter_id || value.user_id || null;
+              const mediaId = value.media_id || value.post_id || value.parent_id || entry?.id || null;
+
+              logDebug(reqId, "Comment event parsed", {
+                eventId,
+                commenterId,
+                mediaId,
+                snippet: commentText.slice(0, 120),
+              });
+
+              // Keyword detection
+              if (commentTextLower.includes("price")) {
+                logDebug(reqId, "Keyword 'price' detected", { eventId, commenterId });
+
+                if (!commenterId) {
+                  logDebug(reqId, "Cannot send DM: commenterId missing", { eventId });
+                  continue;
+                }
+
+                try {
+                  // Compose DM
+                  const dmText = "Thanks for the comment 😊";
+                  const dmResult = await sendInstagramDM(commenterId, dmText);
+                  logDebug(reqId, "DM send result", { eventId, dmResult });
+                } catch (dmError) {
+                  logDebug(reqId, "Failed to send DM", { eventId, error: dmError?.message || dmError });
+                }
+              }
+            }
+          }
+        } catch (processingError) {
+          logDebug(reqId, "Error processing webhook payload", { error: processingError?.message || processingError });
         }
-      })
-    );
-
-    const pagesWithIg = pageDetails.filter((p) => p.hasInstagramBusinessAccount);
-
-    return res.json({
-      ok: true,
-      requestId: reqId,
-      tokenDebug: {
-        isValid: Boolean(debugData.is_valid),
-        appId: debugData.app_id,
-        userId: debugData.user_id,
-        expiresAt: debugData.expires_at,
-        scopes,
-        missingScopes,
-        granularScopes,
-      },
-      pagesCount: pageDetails.length,
-      pagesWithInstagramCount: pagesWithIg.length,
-      pages: pageDetails,
-      troubleshooting: pagesWithIg.length
-        ? []
-        : [
-            "Pages exist but none has instagram_business_account linked",
-            "Link your Instagram Professional account to one of these Pages",
-            "Ensure your app has access to that Page and re-authorize /login",
-          ],
-    });
-  } catch (error) {
-    const graphErr = buildGraphError(error);
-    logDebug(reqId, "Failed in /instagram-data", graphErr.details);
-    return res.status(graphErr.status).json({
-      ok: false,
-      requestId: reqId,
-      error: "Failed to fetch Instagram data",
-      details: graphErr.details,
-    });
-  }
-});
-
-app.get("/debug-token", async (req, res) => {
-  const reqId = makeRequestId();
-  const accessToken = getUserToken(req);
-
-  if (!accessToken) {
-    return res.status(400).json({
-      ok: false,
-      requestId: reqId,
-      error: "No access token available",
-      hint: "Call /auth/callback first, set APP_ACCESS_TOKEN, or pass ?access_token=...",
-    });
-  }
-
-  if (!config.appId || !config.appSecret) {
-    return res.status(500).json({
-      ok: false,
-      requestId: reqId,
-      error: "APP_ID or APP_SECRET missing in environment",
-    });
-  }
-
-  try {
-    logDebug(reqId, "Inspecting token with /debug_token", {
-      token: maskToken(accessToken),
+      })();
     });
 
-    const debugData = await getTokenDebugInfo(accessToken);
-    const scopes = extractScopes(debugData);
-    const missingScopes = findMissingScopes(scopes);
+    // Simple in-memory dedupe set for recent event ids (keeps ids for 5 minutes).
+    // For production, replace with Redis or durable store shared across instances.
+    const recentEvents = new Set();
+    function isDuplicateEvent(id) {
+      if (recentEvents.has(id)) return true;
+      recentEvents.add(id);
+      // auto-expire
+      setTimeout(() => recentEvents.delete(id), 1000 * 60 * 5);
+      return false;
+    }
 
-    const meResponse = await axios.get(`${GRAPH_BASE}/me`, {
-      params: {
-        fields: "id,name",
-        access_token: accessToken,
-      },
-    });
+    /**
+     * sendInstagramDM
+     * - recipientIgUserId: Instagram user id (scoped)
+     * - messageText: plain text message to send
+     * Uses the Graph API: POST /{ig-user-id}/messages with recipient + message
+     * NOTE: Requires a Page/IG Messaging access token with messaging permission.
+     */
+    async function sendInstagramDM(recipientIgUserId, messageText) {
+      const token = savedAccessToken || normalizeAccessToken(process.env.APP_ACCESS_TOKEN);
 
+      if (!token) {
+        throw new Error("No access token available for sending DMs");
+      }
+
+      // Build request body per Instagram Messaging API
+      const body = {
+        recipient: { user_id: recipientIgUserId },
+        message: { text: messageText },
+      };
+
+      const url = `${GRAPH_BASE}/${recipientIgUserId}/messages`;
+
+      const response = await axios.post(url, body, { params: { access_token: token } });
+      return response.data;
+    }
     logDebug(reqId, "Token /debug_token and /me responses ready", {
       isValid: debugData.is_valid,
       scopes,
