@@ -4,6 +4,9 @@ const cors = require("cors");
 const crypto = require("crypto");
 require("dotenv").config();
 
+// ===============================
+// CONFIGURATION & SETUP
+// ===============================
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -17,6 +20,7 @@ const REQUIRED_SCOPES = [
   "instagram_manage_messages",
   "instagram_manage_comments",
 ];
+const IG_ACCOUNT_ID = "17841480751343729"; // Hardcoded specific IG Business Account ID
 
 const config = {
   appId: process.env.APP_ID || "",
@@ -24,17 +28,24 @@ const config = {
   redirectUri: process.env.REDIRECT_URI || "http://localhost:3000/auth/callback",
   webhookVerifyToken: normalizeAccessToken(process.env.WEBHOOK_VERIFY_TOKEN || "my_verify_token"),
   port: Number(process.env.PORT || 3000),
+  nodeEnv: process.env.NODE_ENV || "production",
 };
 
-// In-memory token store. For multi-instance production, persist this externally.
+// ===============================
+// GLOBAL STATE
+// ===============================
+// In-memory token store tracking both the token and its origin.
 let savedAccessToken = normalizeAccessToken(process.env.APP_ACCESS_TOKEN);
+let tokenSource = savedAccessToken ? "Environment Variable (APP_ACCESS_TOKEN)" : "None";
 
+// Simple in-memory dedupe set for recent event ids (keeps ids for 5 minutes).
+const recentEvents = new Set();
+
+// ===============================
+// HELPER FUNCTIONS
+// ===============================
 function normalizeAccessToken(value) {
-  if (typeof value !== "string") {
-    return "";
-  }
-
-  // Remove accidental spaces/newlines from copy-paste.
+  if (typeof value !== "string") return "";
   return value.replace(/\s+/g, "").trim();
 }
 
@@ -43,14 +54,8 @@ function makeRequestId() {
 }
 
 function maskToken(token) {
-  if (!token) {
-    return "<empty>";
-  }
-
-  if (token.length <= 12) {
-    return `${token.slice(0, 2)}***${token.slice(-2)}`;
-  }
-
+  if (!token) return "<empty>";
+  if (token.length <= 12) return `${token.slice(0, 2)}***${token.slice(-2)}`;
   return `${token.slice(0, 6)}...${token.slice(-6)}`;
 }
 
@@ -61,21 +66,15 @@ function getTimestamp() {
 function logDebug(reqId, message, meta) {
   if (meta) {
     console.log(`[${getTimestamp()}][${reqId}] ${message}`, meta);
-    return;
+  } else {
+    console.log(`[${getTimestamp()}][${reqId}] ${message}`);
   }
-  console.log(`[${getTimestamp()}][${reqId}] ${message}`);
 }
 
 function getUserToken(req) {
   const fromQuery = normalizeAccessToken(req.query.access_token);
-  if (fromQuery) {
-    return fromQuery;
-  }
-
-  if (savedAccessToken) {
-    return savedAccessToken;
-  }
-
+  if (fromQuery) return fromQuery;
+  if (savedAccessToken) return savedAccessToken;
   return normalizeAccessToken(process.env.APP_ACCESS_TOKEN);
 }
 
@@ -86,53 +85,27 @@ function buildLoginUrl() {
     scope: REQUIRED_SCOPES.join(","),
     response_type: "code",
   });
-
   return `https://www.facebook.com/${GRAPH_VERSION}/dialog/oauth?${params.toString()}`;
 }
 
 async function getTokenDebugInfo(userToken) {
   const appAccessToken = `${config.appId}|${config.appSecret}`;
-
   const response = await axios.get(`${GRAPH_BASE}/debug_token`, {
     params: {
       input_token: userToken,
       access_token: appAccessToken,
     },
   });
-
   return response.data?.data || {};
 }
 
 function extractScopes(debugData) {
-  const scopes = Array.isArray(debugData.scopes) ? debugData.scopes : [];
-  return scopes;
+  return Array.isArray(debugData.scopes) ? debugData.scopes : [];
 }
 
 function findMissingScopes(scopes) {
   const scopeSet = new Set(scopes);
   return REQUIRED_SCOPES.filter((scope) => !scopeSet.has(scope));
-}
-
-function extractPageIdsFromGranularScopes(granularScopes) {
-  if (!Array.isArray(granularScopes)) {
-    return [];
-  }
-
-  // Meta may return several granular scopes, each with its own target_ids list.
-  // We collect every target_id so we can bypass /me/accounts completely.
-  const pageIds = granularScopes.flatMap((scope) => {
-    if (!scope || !Array.isArray(scope.target_ids)) {
-      return [];
-    }
-
-    return scope.target_ids;
-  });
-
-  return [...new Set(pageIds.map(String).filter(Boolean))];
-}
-
-function getSafeArray(value) {
-  return Array.isArray(value) ? value : [];
 }
 
 function buildGraphError(error) {
@@ -143,51 +116,77 @@ function buildGraphError(error) {
 }
 
 function parseWebhookVerification(req) {
-  // Meta sends these query params when verifying the webhook endpoint.
-  const mode = typeof req.query["hub.mode"] === "string" ? req.query["hub.mode"] : "";
-  const token = typeof req.query["hub.verify_token"] === "string" ? req.query["hub.verify_token"] : "";
-  const challenge = typeof req.query["hub.challenge"] === "string" ? req.query["hub.challenge"] : "";
-
   return {
-    mode,
-    token: normalizeAccessToken(token),
-    challenge,
+    mode: typeof req.query["hub.mode"] === "string" ? req.query["hub.mode"] : "",
+    token: normalizeAccessToken(typeof req.query["hub.verify_token"] === "string" ? req.query["hub.verify_token"] : ""),
+    challenge: typeof req.query["hub.challenge"] === "string" ? req.query["hub.challenge"] : "",
   };
 }
 
 function getWebhookSignatureHeaders(req) {
-  // Placeholder for future signature verification.
   return {
     sha256: typeof req.get("x-hub-signature-256") === "string" ? req.get("x-hub-signature-256") : "",
     legacy: typeof req.get("x-hub-signature") === "string" ? req.get("x-hub-signature") : "",
   };
 }
 
+function isDuplicateEvent(id) {
+  if (recentEvents.has(id)) return true;
+  recentEvents.add(id);
+  setTimeout(() => recentEvents.delete(id), 1000 * 60 * 5); // Auto-expire after 5 minutes
+  return false;
+}
+
+/**
+ * sendInstagramDM
+ * - Sends a DM via the Graph API to a specific user.
+ * - Requires a valid Page Access Token linked to the IG account.
+ */
+async function sendInstagramDM(recipientIgUserId, messageText) {
+  const token = savedAccessToken || normalizeAccessToken(process.env.APP_ACCESS_TOKEN);
+  if (!token) throw new Error("No access token available for sending DMs");
+
+  const body = {
+    recipient: { user_id: recipientIgUserId },
+    message: { text: messageText },
+  };
+
+  const url = `${GRAPH_BASE}/${recipientIgUserId}/messages`;
+  const response = await axios.post(url, body, { params: { access_token: token } });
+  return response.data;
+}
+
+// ===============================
+// ROUTES: CORE & OAUTH
+// ===============================
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "Instagram Automation Backend",
     graphVersion: GRAPH_VERSION,
-    routes: ["/login", "/auth/callback", "/instagram-data"],
+    routes: ["/login", "/auth/callback", "/instagram-data", "/webhook", "/subscribe-app", "/check-subscription", "/token-test", "/ig-account", "/show-token"],
   });
 });
 
+/**
+ * GET /login
+ * OAuth Flow Step 1: Redirects the user to Facebook's OAuth dialog to grant permissions.
+ */
 app.get("/login", (req, res) => {
   const reqId = makeRequestId();
-
-  if (!config.appId) {
-    return res.status(500).json({
-      ok: false,
-      requestId: reqId,
-      error: "APP_ID missing in environment",
-    });
-  }
+  if (!config.appId) return res.status(500).json({ ok: false, requestId: reqId, error: "APP_ID missing in environment" });
 
   const url = buildLoginUrl();
   logDebug(reqId, "Redirecting to Meta OAuth", { redirectUri: config.redirectUri });
   return res.redirect(url);
 });
 
+/**
+ * GET /auth/callback
+ * OAuth Flow Step 2: Meta redirects back here with a short-lived `code`.
+ * We exchange this `code` for a real Access Token and store it in memory.
+ */
 app.get("/auth/callback", async (req, res) => {
   const reqId = makeRequestId();
   const code = req.query.code;
@@ -195,63 +194,27 @@ app.get("/auth/callback", async (req, res) => {
 
   if (oauthError) {
     return res.status(400).json({
-      ok: false,
-      requestId: reqId,
-      error: "OAuth callback contains an error",
-      details: {
-        error: req.query.error,
-        error_reason: req.query.error_reason,
-        error_description: req.query.error_description,
-      },
+      ok: false, requestId: reqId, error: "OAuth callback error",
+      details: { error: req.query.error, reason: req.query.error_reason, description: req.query.error_description },
     });
   }
-
-  if (!code) {
-    return res.status(400).json({
-      ok: false,
-      requestId: reqId,
-      error: "Missing authorization code",
-    });
-  }
-
-  if (!config.appId || !config.appSecret || !config.redirectUri) {
-    return res.status(500).json({
-      ok: false,
-      requestId: reqId,
-      error: "Missing APP_ID, APP_SECRET, or REDIRECT_URI configuration",
-    });
-  }
+  if (!code) return res.status(400).json({ ok: false, requestId: reqId, error: "Missing authorization code" });
+  if (!config.appId || !config.appSecret || !config.redirectUri) return res.status(500).json({ ok: false, requestId: reqId, error: "Missing configuration variables" });
 
   try {
     logDebug(reqId, "Exchanging OAuth code for user token");
-
     const tokenResponse = await axios.get(`${GRAPH_BASE}/oauth/access_token`, {
-      params: {
-        client_id: config.appId,
-        client_secret: config.appSecret,
-        redirect_uri: config.redirectUri,
-        code,
-      },
+      params: { client_id: config.appId, client_secret: config.appSecret, redirect_uri: config.redirectUri, code },
     });
 
     const accessToken = normalizeAccessToken(tokenResponse.data?.access_token);
-    const tokenType = tokenResponse.data?.token_type || "unknown";
-    const expiresIn = tokenResponse.data?.expires_in || null;
+    if (!accessToken) return res.status(500).json({ ok: false, requestId: reqId, error: "Token exchange returned an empty token" });
 
-    if (!accessToken) {
-      return res.status(500).json({
-        ok: false,
-        requestId: reqId,
-        error: "Token exchange succeeded but access token was empty",
-      });
-    }
-
+    // Persist latest token and update tracking source
     savedAccessToken = accessToken;
-    logDebug(reqId, "Received and saved access token", {
-      token: maskToken(accessToken),
-      tokenType,
-      expiresIn,
-    });
+    tokenSource = "OAuth Login Flow";
+    
+    logDebug(reqId, "Received and saved access token", { token: maskToken(accessToken), source: tokenSource });
 
     let debugData = {};
     let scopes = [];
@@ -261,283 +224,131 @@ app.get("/auth/callback", async (req, res) => {
       debugData = await getTokenDebugInfo(accessToken);
       scopes = extractScopes(debugData);
       missingScopes = findMissingScopes(scopes);
-      logDebug(reqId, "Token scopes from /debug_token", { scopes, missingScopes });
     } catch (debugErr) {
-      const graphErr = buildGraphError(debugErr);
-      logDebug(reqId, "Failed to inspect token", graphErr.details);
+      logDebug(reqId, "Failed to inspect token", buildGraphError(debugErr).details);
     }
 
     return res.json({
-      ok: true,
-      requestId: reqId,
-      message: "Instagram connected successfully",
-      token: {
-        masked: maskToken(accessToken),
-        tokenType,
-        expiresIn,
-      },
-      scopes,
-      missingScopes,
-      note: "Token is stored in server memory as savedAccessToken",
+      ok: true, requestId: reqId, message: "Instagram connected successfully",
+      token: { masked: maskToken(accessToken), source: tokenSource },
+      scopes, missingScopes,
     });
   } catch (error) {
     const graphErr = buildGraphError(error);
     logDebug(reqId, "OAuth callback failed", graphErr.details);
-    return res.status(graphErr.status).json({
-      ok: false,
-      requestId: reqId,
-      error: "OAuth failed",
-      details: graphErr.details,
-    });
+    return res.status(graphErr.status).json({ ok: false, requestId: reqId, error: "OAuth failed", details: graphErr.details });
   }
 });
 
-app.get("/instagram-data", async (req, res) => {
+// ===============================
+// ROUTES: DIAGNOSTICS & SUBSCRIPTIONS
+// ===============================
+
+/**
+ * GET /token-test
+ * Tests the validity of the current token by querying the basic /me endpoint.
+ */
+app.get("/token-test", async (req, res) => {
   const reqId = makeRequestId();
-  const accessToken = getUserToken(req);
-
-  if (!accessToken) {
-    return res.status(400).json({
-      ok: false,
-      requestId: reqId,
-      error: "No access token available",
-      hint: "Call /login -> /auth/callback first, or set APP_ACCESS_TOKEN, or pass ?access_token=...",
-    });
-  }
-
-  if (!config.appId || !config.appSecret) {
-    return res.status(500).json({
-      ok: false,
-      requestId: reqId,
-      error: "APP_ID or APP_SECRET missing in environment",
-    });
-  }
-
-  logDebug(reqId, "Using token for /instagram-data", {
-    token: maskToken(accessToken),
-  });
+  const token = getUserToken(req);
+  if (!token) return res.status(400).json({ ok: false, error: "No token available to test." });
 
   try {
-    // STEP 1: Validate the token and inspect granular scopes first.
-    const debugData = await getTokenDebugInfo(accessToken);
-    const scopes = extractScopes(debugData);
-    const missingScopes = findMissingScopes(scopes);
-    const granularScopes = getSafeArray(debugData.granular_scopes);
-    const pageIds = extractPageIdsFromGranularScopes(granularScopes);
-
-    if (!debugData.is_valid) {
-      return res.status(401).json({
-        ok: false,
-        requestId: reqId,
-        error: "Access token is invalid",
-        debugToken: {
-          appId: debugData.app_id,
-          userId: debugData.user_id,
-          expiresAt: debugData.expires_at,
-          isValid: debugData.is_valid,
-          scopes,
-          missingScopes,
-        },
-      });
-    }
-
-    // WEBHOOK EVENTS
-    // Meta sends Instagram webhook payloads here after verification succeeds.
-    // This handler is defensive and never assumes req.body has a specific shape.
-    app.post("/webhook", (req, res) => {
-      const reqId = makeRequestId();
-      // Developer convenience: print raw body to console for quick debugging
-      console.log("======================================");
-      console.log("WEBHOOK POST HIT");
-      console.log(new Date().toISOString());
-      console.log("\nBODY:");
-      try {
-        console.log(JSON.stringify(req.body, null, 2));
-      } catch (e) {
-        console.log(String(req.body));
-      }
-      console.log("======================================");
-
-      // Acknowledge immediately to avoid Meta retries. Processing continues async.
-      res.status(200).send("EVENT_RECEIVED");
-
-      (async () => {
-        try {
-          const signatures = getWebhookSignatureHeaders(req);
-          if (signatures.sha256 || signatures.legacy) {
-            logDebug(reqId, "Webhook signature headers detected", {
-              hasSha256: Boolean(signatures.sha256),
-              hasLegacy: Boolean(signatures.legacy),
-            });
-          }
-
-          const body = req.body && typeof req.body === "object" ? req.body : {};
-
-          logDebug(reqId, "Instagram webhook event received", {
-            object: body.object || null,
-            entryCount: Array.isArray(body.entry) ? body.entry.length : 0,
-          });
-
-          // Process each entry -> changes array.
-          const entries = Array.isArray(body.entry) ? body.entry : [];
-
-          for (const entry of entries) {
-            const changes = Array.isArray(entry.changes) ? entry.changes : [];
-
-            for (const change of changes) {
-              const value = change?.value || {};
-
-              // Build a dedupe id for the event. Prefer comment_id if present.
-              const eventId = value.comment_id || value.id || value.message_id || `${entry.id || ""}:${change.field || ""}:${value.created_time || ""}`;
-
-              if (!eventId) {
-                logDebug(reqId, "Skipping event with no identifiable id", { change });
-                continue;
-              }
-
-              if (isDuplicateEvent(eventId)) {
-                logDebug(reqId, "Duplicate event ignored", { eventId });
-                continue;
-              }
-
-              // Detect comment events. Meta uses 'item': 'comment' and 'verb': 'add' for new comments.
-              const isComment = value?.item === "comment" || Boolean(value?.comment_id) || typeof value?.text === "string";
-
-              if (!isComment) {
-                logDebug(reqId, "Non-comment event ignored", { field: change.field || null });
-                continue;
-              }
-
-              // Extract comment metadata safely
-              const commentText = (value.text || value.message || value.comment_text || "").toString();
-              const commentTextLower = commentText.toLowerCase();
-              const commenterId = value.from?.id || value.commenter_id || value.user_id || null;
-              const mediaId = value.media_id || value.post_id || value.parent_id || entry?.id || null;
-
-              logDebug(reqId, "Comment event parsed", {
-                eventId,
-                commenterId,
-                mediaId,
-                snippet: commentText.slice(0, 120),
-              });
-
-              // Keyword detection
-              if (commentTextLower.includes("price")) {
-                logDebug(reqId, "Keyword 'price' detected", { eventId, commenterId });
-
-                if (!commenterId) {
-                  logDebug(reqId, "Cannot send DM: commenterId missing", { eventId });
-                  continue;
-                }
-
-                try {
-                  // Compose DM
-                  const dmText = "Thanks for the comment 😊";
-                  const dmResult = await sendInstagramDM(commenterId, dmText);
-                  logDebug(reqId, "DM send result", { eventId, dmResult });
-                } catch (dmError) {
-                  logDebug(reqId, "Failed to send DM", { eventId, error: dmError?.message || dmError });
-                }
-              }
-            }
-          }
-        } catch (processingError) {
-          logDebug(reqId, "Error processing webhook payload", { error: processingError?.message || processingError });
-        }
-      })();
+    const response = await axios.get(`${GRAPH_BASE}/me`, {
+      params: { access_token: token, fields: "id,name,email" }
     });
+    res.json({ ok: true, source: tokenSource, data: response.data });
+  } catch (error) {
+    res.status(error.response?.status || 500).json({ ok: false, error: "Token is invalid or expired", details: error.response?.data || error.message });
+  }
+});
 
-    // Simple in-memory dedupe set for recent event ids (keeps ids for 5 minutes).
-    // For production, replace with Redis or durable store shared across instances.
-    const recentEvents = new Set();
-    function isDuplicateEvent(id) {
-      if (recentEvents.has(id)) return true;
-      recentEvents.add(id);
-      // auto-expire
-      setTimeout(() => recentEvents.delete(id), 1000 * 60 * 5);
-      return false;
-    }
+/**
+ * GET /show-token
+ * Dev-only route to reveal token sources and optionally the raw token for debugging.
+ */
+app.get("/show-token", (req, res) => {
+  const token = getUserToken(req);
+  const isDev = config.nodeEnv === "development";
+  
+  res.json({
+    ok: true,
+    source: tokenSource,
+    maskedToken: maskToken(token),
+    fullToken: isDev ? token : "HIDDEN_IN_PRODUCTION (Set NODE_ENV=development to reveal)",
+  });
+});
 
-    /**
-     * sendInstagramDM
-     * - recipientIgUserId: Instagram user id (scoped)
-     * - messageText: plain text message to send
-     * Uses the Graph API: POST /{ig-user-id}/messages with recipient + message
-     * NOTE: Requires a Page/IG Messaging access token with messaging permission.
-     */
-    async function sendInstagramDM(recipientIgUserId, messageText) {
-      const token = savedAccessToken || normalizeAccessToken(process.env.APP_ACCESS_TOKEN);
+/**
+ * GET /subscribe-app
+ * App Installation: Binds the app to the specific Instagram account so Meta routes webhooks to us.
+ */
+app.get("/subscribe-app", async (req, res) => {
+  const reqId = makeRequestId();
+  const token = getUserToken(req);
+  if (!token) return res.status(400).json({ ok: false, error: "Missing access token" });
 
-      if (!token) {
-        throw new Error("No access token available for sending DMs");
-      }
-
-      // Build request body per Instagram Messaging API
-      const body = {
-        recipient: { user_id: recipientIgUserId },
-        message: { text: messageText },
-      };
-
-      const url = `${GRAPH_BASE}/${recipientIgUserId}/messages`;
-
-      const response = await axios.post(url, body, { params: { access_token: token } });
-      return response.data;
-    }
-    logDebug(reqId, "Token /debug_token and /me responses ready", {
-      isValid: debugData.is_valid,
-      scopes,
-      missingScopes,
+  try {
+    logDebug(reqId, "Attempting to subscribe app to IG account webhooks", { IG_ACCOUNT_ID });
+    const response = await axios.post(`${GRAPH_BASE}/${IG_ACCOUNT_ID}/subscribed_apps`, {}, {
+      params: { access_token: token }
     });
-
-    return res.json({
-      ok: true,
-      requestId: reqId,
-      token: {
-        masked: maskToken(accessToken),
-      },
-      debugToken: debugData,
-      me: meResponse.data,
-      scopes,
-      missingScopes,
-    });
+    res.json({ ok: true, message: "Subscription command sent", response: response.data });
   } catch (error) {
     const graphErr = buildGraphError(error);
-    logDebug(reqId, "Debug-token route failed", graphErr.details);
-    return res.status(graphErr.status).json({
-      ok: false,
-      requestId: reqId,
-      error: "Debug failed",
-      details: graphErr.details,
+    logDebug(reqId, "Failed to subscribe app", graphErr.details);
+    res.status(graphErr.status).json(graphErr.details);
+  }
+});
+
+/**
+ * GET /check-subscription
+ * Verifies if the app is currently subscribed to receive webhooks for the IG account.
+ */
+app.get("/check-subscription", async (req, res) => {
+  const reqId = makeRequestId();
+  const token = getUserToken(req);
+  if (!token) return res.status(400).json({ ok: false, error: "Missing access token" });
+
+  try {
+    const response = await axios.get(`${GRAPH_BASE}/${IG_ACCOUNT_ID}/subscribed_apps`, {
+      params: { access_token: token }
     });
+    logDebug(reqId, "Subscription status checked", response.data);
+    res.json({ ok: true, data: response.data });
+  } catch (error) {
+    res.status(error.response?.status || 500).json(error.response?.data || error.message);
+  }
+});
+
+app.get("/ig-account", async (req, res) => {
+  try {
+    const response = await axios.get(`${GRAPH_BASE}/${IG_ACCOUNT_ID}`, {
+      params: { fields: "id,username,followers_count,media_count", access_token: getUserToken(req) },
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json(error.response?.data || error.message);
   }
 });
 
 // ===============================
-// WEBHOOK CONFIG
+// ROUTES: WEBHOOKS
 // ===============================
-// Use a dedicated verify token for Meta webhook setup.
-// Store it in WEBHOOK_VERIFY_TOKEN in production.
 
-// WEBHOOK VERIFICATION
-// Meta calls this route during webhook setup with hub.mode, hub.verify_token, and hub.challenge.
+/**
+ * GET /webhook
+ * Webhook Verification: Meta pings this route once when you configure the URL in the App Dashboard.
+ * It ensures you control the server by matching the WEBHOOK_VERIFY_TOKEN.
+ */
 app.get("/webhook", (req, res) => {
   const reqId = makeRequestId();
   const { mode, token, challenge } = parseWebhookVerification(req);
 
-  logDebug(reqId, "Webhook verification request received", {
-    mode: mode || null,
-    token: maskToken(token),
-    challengeReceived: Boolean(challenge),
-  });
+  logDebug(reqId, "Webhook verification request received", { mode: mode || null, token: maskToken(token), challengeReceived: Boolean(challenge) });
 
-  if (mode !== "subscribe") {
-    return res.sendStatus(400);
-  }
-
-  if (!challenge) {
-    return res.sendStatus(400);
-  }
-
+  if (mode !== "subscribe" || !challenge) return res.sendStatus(400);
+  
   if (token !== config.webhookVerifyToken) {
     logDebug(reqId, "Webhook verification failed: invalid verify token");
     return res.sendStatus(403);
@@ -547,43 +358,102 @@ app.get("/webhook", (req, res) => {
   return res.status(200).send(challenge);
 });
 
-// WEBHOOK EVENTS
-// Meta sends Instagram webhook payloads here after verification succeeds.
-// This handler is defensive and never assumes req.body has a specific shape.
+/**
+ * POST /webhook
+ * Webhook Processing: Receives live events (comments, messages) from Meta.
+ */
 app.post("/webhook", (req, res) => {
   const reqId = makeRequestId();
+  console.log(`\n[${getTimestamp()}][${reqId}] 🔥 RAW WEBHOOK PAYLOAD HIT:`);
+  console.log(JSON.stringify(req.body, null, 2));
 
-  try {
-    const signatures = getWebhookSignatureHeaders(req);
-    if (signatures.sha256 || signatures.legacy) {
-      logDebug(reqId, "Webhook signature headers detected", {
-        hasSha256: Boolean(signatures.sha256),
-        hasLegacy: Boolean(signatures.legacy),
-      });
+  // 1. Acknowledge immediately to prevent Meta from retrying the delivery
+  res.status(200).send("EVENT_RECEIVED");
+
+  // 2. Process events asynchronously to free up the HTTP response
+  setImmediate(async () => {
+    try {
+      const body = req.body && typeof req.body === "object" ? req.body : {};
+      const entries = Array.isArray(body.entry) ? body.entry : [];
+
+      for (const entry of entries) {
+        const changes = Array.isArray(entry.changes) ? entry.changes : [];
+
+        for (const change of changes) {
+          const value = change?.value || {};
+          const fieldName = change?.field || "unknown_field";
+          
+          // Defensive ID check - fallback to synthetic string if strict ID is missing
+          const eventId = value.comment_id || value.id || value.message_id || `${entry.id || "entry"}:${fieldName}:${value.created_time || Date.now()}`;
+
+          // Event deduplication check
+          if (isDuplicateEvent(eventId)) {
+            logDebug(reqId, `Duplicate event ignored [ID: ${eventId}]`);
+            continue;
+          }
+
+          // Broad check to safely handle text bodies from both real IG and Test payloads
+          const isComment = value.item === "comment" || Boolean(value.comment_id) || fieldName === "comments" || typeof value.text === "string";
+
+          if (!isComment) {
+            logDebug(reqId, `Non-comment event ignored. Field: ${fieldName}`);
+            continue;
+          }
+
+          // Extract metrics safely
+          const commentText = String(value.text || value.message || value.comment_text || "").trim();
+          const commentTextLower = commentText.toLowerCase();
+          const commenterId = value.from?.id || value.commenter_id || value.user_id || null;
+          const mediaId = value.media_id || value.post_id || value.parent_id || entry.id || null;
+
+          logDebug(reqId, "💬 Comment event parsed", {
+            eventId,
+            fieldName,
+            commenterId,
+            mediaId,
+            text: commentText
+          });
+
+          // Keyword automation trigger
+          if (commentTextLower.includes("price")) {
+            logDebug(reqId, "🎯 Keyword 'price' detected!", { eventId, commenterId });
+
+            if (!commenterId) {
+              logDebug(reqId, "❌ Cannot send DM: commenterId missing from payload.", { eventId });
+              continue;
+            }
+
+            try {
+              const dmText = "Thanks for asking about the price! 😊 Let me know if you need details.";
+              const dmResult = await sendInstagramDM(commenterId, dmText);
+              logDebug(reqId, "✅ DM sent successfully", { eventId, messageId: dmResult.message_id });
+            } catch (dmError) {
+              logDebug(reqId, "❌ Failed to send DM", { eventId, error: dmError?.response?.data || dmError.message });
+            }
+          }
+        }
+      }
+    } catch (error) {
+      logDebug(reqId, "Webhook async handler failed", { error: error.message });
     }
-
-    const body = req.body && typeof req.body === "object" ? req.body : {};
-
-    logDebug(reqId, "Instagram webhook event received", {
-      object: body.object || null,
-      entryCount: Array.isArray(body.entry) ? body.entry.length : 0,
-    });
-
-    console.log(`[${getTimestamp()}][${reqId}] WEBHOOK EVENT PAYLOAD`);
-    console.log(JSON.stringify(body, null, 2));
-
-    // ACK quickly so Meta does not retry the delivery.
-    return res.sendStatus(200);
-  } catch (error) {
-    logDebug(reqId, "Webhook event handler failed", {
-      error: error.message || "Unknown error",
-    });
-
-    return res.sendStatus(500);
-  }
+  });
 });
 
+// ===============================
+// SERVER STARTUP
+// ===============================
 app.listen(config.port, () => {
-  console.log(`Server running on port ${config.port}`);
-  console.log(`Redirect URI: ${config.redirectUri}`);
+  console.log("\n=================================");
+  console.log("🚀 Server running on port:", config.port);
+  console.log("🔄 Environment:", config.nodeEnv);
+  console.log("🔗 Redirect URI:", config.redirectUri);
+  console.log("=================================");
+  
+  // Startup Diagnostics
+  console.log("🛠️  Diagnostics:");
+  console.log(`- APP_ID:               ${config.appId ? "✅ Present" : "❌ Missing"}`);
+  console.log(`- APP_SECRET:           ${config.appSecret ? "✅ Present" : "❌ Missing"}`);
+  console.log(`- WEBHOOK_VERIFY_TOKEN: ${config.webhookVerifyToken ? "✅ Present" : "❌ Missing"}`);
+  console.log(`- APP_ACCESS_TOKEN:     ${process.env.APP_ACCESS_TOKEN ? "✅ Present (Loaded into memory)" : "⚠️ Missing (Must auth via /login)"}`);
+  console.log("=================================\n");
 });
