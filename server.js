@@ -326,7 +326,17 @@ app.get("/check-subscription", async (req, res) => {
     res.status(error.response?.status || 500).json(error.response?.data || error.message);
   }
 });
-
+app.get("/page-token", async (req, res) => {
+  const token = getUserToken(req);
+  try {
+    const response = await axios.get(`${GRAPH_BASE}/me/accounts`, {
+      params: { access_token: token }
+    });
+    res.json(response.data); // shows all pages + their access_tokens
+  } catch (err) {
+    res.status(500).json(err.response?.data || err.message);
+  }
+});
 app.get("/ig-account", async (req, res) => {
   try {
     const response = await axios.get(`${GRAPH_BASE}/${IG_ACCOUNT_ID}`, {
