@@ -186,7 +186,13 @@ app.get("/login", (req, res) => {
  * GET /auth/callback
  * OAuth Flow Step 2: Meta redirects back here with a short-lived `code`.
  * We exchange this `code` for a real Access Token and store it in memory.
+ * 
  */
+app.get("/show-full-token", (req, res) => {
+  res.json({
+    token: savedAccessToken
+  });
+});
 app.get("/auth/callback", async (req, res) => {
   const reqId = makeRequestId();
   const code = req.query.code;
@@ -291,7 +297,7 @@ app.get("/subscribe-app", async (req, res) => {
   try {
     logDebug(reqId, "Attempting to subscribe app to IG account webhooks", { IG_ACCOUNT_ID });
     const response = await axios.post(`${GRAPH_BASE}/${IG_ACCOUNT_ID}/subscribed_apps`, {}, {
-      params: { access_token: token }
+      params: { access_token: token, subscribed_fields: "comments,messages,mentions" }
     });
     res.json({ ok: true, message: "Subscription command sent", response: response.data });
   } catch (error) {
